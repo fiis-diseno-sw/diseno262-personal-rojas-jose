@@ -1,0 +1,66 @@
+# Presentación Técnica y Trazabilidad de Arquitectura: AgentHub
+
+Este documento articula el diseño arquitectónico de **AgentHub**, integrando los diagramas generados en notación C4 (exportados a formato vectorial `.svg`) con la justificación técnica de las decisiones y la matriz de trazabilidad hacia los atributos de calidad priorizados.
+
+---
+
+## 1. Nivel 1: Diagrama de Contexto del Sistema
+
+El diagrama de contexto sitúa a **AgentHub** en su ecosistema de negocio, delimitando la interacción con los tres perfiles de usuario clave y los cinco sistemas externos necesarios para la operación financiera, fiscal, de inferencia y de conectividad empresarial.
+
+![Diagrama de Contexto - AgentHub](./test-arquitectura/c4_contexto_agenthub.svg)
+
+### Análisis de Entidades y Flujos Perimetrales:
+* **Desarrolladores y Casas de Software:** Interactúan para registrar agentes, someter nuevas versiones al proceso de revisión automatizada y liquidar los ingresos acumulados tras la retención de la comisión del 20%.
+* **Organizaciones (Admins y Devs Internos):** Descubren agentes, ejecutan pruebas de concepto gratuitas (hasta 50 invocaciones en entorno sandbox) y consumen los agentes contratados a través de un canal unificado mediante API Keys.
+* **Infraestructura Externa de Agentes de IA:** Aloja la lógica y cómputo de inferencia en las nubes privadas de los desarrolladores, abstrayendo a los clientes de configuraciones de red directas.
+* **Pasarela de Pagos y Autoridad Fiscal (SUNAT / OSE):** Habilitan el cobro automatizado recurrente a organizaciones y la emisión de facturas electrónicas bajo estándar UBL 2.1 con certificación digital.
+
+---
+
+## 2. Nivel 2: Diagrama de Contenedores
+
+El diagrama de contenedores desglosa la plataforma en sus límites de ejecución, evidenciando la segregación entre las interfaces de usuario (SPAs), los gateways perimetrales, los servicios desacoplados de dominio y el almacenamiento políglota.
+
+![Diagrama de Contenedores - AgentHub](./test-arquitectura/c4_contenedores_agenthub.svg)
+
+### Decisiones Estructurales de Contenedores:
+1. **Segregación de Gateways (Portal Gateway vs. Execution Gateway):**
+   - El tráfico de administración y visualización web (CRUD de portales) se canaliza mediante un API Gateway estándar, protegiendo las APIs internas.
+   - El tráfico de ejecución e inferencia se aísla en el **Agent Execution Gateway & Metering Engine**, desarrollado en lenguaje Go/Envoy para maximizar el throughput de streaming I/O y minimizar el overhead de memoria por conexión.
+2. **Caché Distribuida con Redis Cluster:** Permite validar API Keys revocadas o activas y computar límites de velocidad en memoria local con latencias inferiores a $5\text{ ms}$, evitando saturar la base de datos relacional.
+3. **Pipeline Asíncrono de Métricas con Apache Kafka:** Desacopla la respuesta al cliente corporativo de la persistencia de cobro. Las métricas de tokens y tiempo se publican como eventos en Kafka, siendo ingeridas en batch hacia **TimescaleDB/ClickHouse** (analítica) y el **Servicio de Facturación** (liquidación quincenal).
+
+---
+
+## 3. Nivel 3: Diagrama de Componentes (Agent Execution Gateway)
+
+Se realiza el zoom sobre el contenedor de ejecución e invocación unificada, al ser el núcleo operativo sobre el cual recaen las mayores exigencias de **Disponibilidad**, **Seguridad**, **Interoperabilidad** y **Escalabilidad**.
+
+![Diagrama de Componentes - Execution Gateway](./test-arquitectura/c4_componentes_gateway_agenthub.svg)
+
+### Funcionamiento del Pipeline de Invocación Interno:
+1. **`API Key & Org Authentication Filter`:** Intercepta la petición HTTP/gRPC entrante, computa el hash criptográfico del header de autorización y valida su vigencia contra el clúster Redis.
+2. **`Rate Limiter & Quota Guard`:** Ejecuta el algoritmo Token Bucket para mitigar ráfagas abusivas y valida que la organización cuente con balance de crédito o plan activo.
+3. **`Sandbox Trial Interceptor`:** Discrimina si la petición corresponde a una prueba gratuita. Si es sandbox, verifica que no haya excedido el límite de 50 peticiones y sustituye datos por conjuntos mockeados provistos por el desarrollador.
+4. **`Payload Transformer & Schema Validator`:** Adapta la estructura JSON/gRPC del cliente al esquema esperado por la versión contratada del agente de IA, incorporando el ID de conversación si es multi-turno.
+5. **`Dynamic Router & Circuit Breaker`:** Resuelve la URL segura del desarrollador y monitorea la salud del servicio remoto. Si el agente remoto supera los $15\text{ s}$ de timeout o falla 5 veces consecutivas, abre el circuito para evitar saturación de conexiones.
+6. **`Egress HTTP/gRPC Agent Dispatcher`:** Realiza la llamada sobre TLS 1.3 inyectando de forma transparente los secrets de infraestructura del desarrollador.
+7. **`Usage Telemetry & Metering Publisher`:** Lee la cabecera de tokens consumidos devuelta por el modelo y publica de manera no bloqueante el evento `AgentInvocatedEvent` hacia Kafka para su contabilización financiera.
+
+---
+
+## 4. Matriz de Trazabilidad Integral: Componentes C4 vs. Atributos de Calidad
+
+A continuación se mapea la correspondencia entre los componentes del sistema, los escenarios de calidad definidos y la medida de respuesta esperada:
+
+| Atributo de Calidad | Escenario | Componente(s) Responsable(s) en C4 | Decisión de Diseño Clave | Métrica de Aceptación Verificada |
+| :--- | :--- | :--- | :--- | :--- |
+| **Disponibilidad** | **DISP-01** (Fallo de nodo de gateway) | `Portal Gateway`, `Agent Execution Gateway` | Despliegue en clúster multi-pod con health-checks activos y auto-recovery. | Error rate $< 0.01\%$; restauración completa de pods en $\le 30\text{ s}$. |
+| **Disponibilidad** | **DISP-02** (Fallo en agente externo) | `Dynamic Router & Circuit Breaker` | Patrón Circuit Breaker con Resilience4j/Envoy filters para aislar caídas de terceros. | Timeout estricto; apertura de circuito tras 5 fallos; fallback devuelto en $\le 500\text{ ms}$. |
+| **Seguridad** | **SEG-01** (Acceso con API Key no autorizada) | `API Key & Org Authentication Filter`, `CacheStore (Redis)` | Verificación en caché de hash SHA-256 de claves y matriz de suscripción activa. | $100\%$ de invocaciones no autorizadas bloqueadas en el perímetro en $\le 15\text{ ms}$. |
+| **Seguridad** | **SEG-02** (Confidencialidad en tránsito/reposo) | `Egress Agent Dispatcher`, `Usage Telemetry Publisher` | Cifrado TLS 1.3 / mTLS y política de cero persistencia de payloads en los logs de metering. | $0\%$ de exposición de datos sensibles corporativos en auditoría y logs de cobro. |
+| **Interoperabilidad**| **INT-01** (Adaptación Slack / CRM) | `Servicio de Conectores`, `Payload Transformer` | Normalizador de esquemas a contrato unificado JSON/gRPC multi-turno. | Sobrecarga de transformación $\le 40\text{ ms}$; compatibilidad total con conectores estándar. |
+| **Interoperabilidad**| **INT-02** (Emisión fiscal SUNAT) | `Servicio de Facturación`, `Tax Authority Client` | Pipeline de generación y firma XML UBL 2.1 desacoplado de la ruta de invocación. | Emisión y recepción de CDR conforme a ley en $\le 5.0\text{ s}$ por comprobante electrónico. |
+| **Escalabilidad** | **ESC-01** (Ráfaga de tráfico batch) | `Agent Execution Gateway`, `Rate Limiter` | Arquitectura basada en Go/Envoy con autoscaling horizontal dinámico (KEDA). | Latencia de gateway $\le 80\text{ ms}$; $0\%$ de solicitudes perdidas por falta de recursos locales. |
+| **Escalabilidad** | **ESC-02** (Ingesta masiva de metering) | `Usage Telemetry Publisher`, `Bus de Eventos (Kafka)` | Despacho asíncrono no bloqueante a tópicos particionados y persistencia columnar. | Sobrecarga agregada al proxy $\le 5\text{ ms}$; $100\%$ consistencia eventual en cobranza. |
